@@ -2903,6 +2903,8 @@
       GoogleAuthProvider,
       OAuthProvider,
       signInWithPopup,
+      signInWithRedirect,
+      getRedirectResult,
       signInWithEmailAndPassword,
       createUserWithEmailAndPassword,
       updateProfile,
@@ -3368,13 +3370,15 @@
           return "Kata sandi terlalu lemah (minimal 6 karakter).";
         case "auth/network-request-failed":
           return "Jaringan gagal. Periksa koneksi internet Anda lalu coba lagi.";
+        case "auth/popup-blocked":
+          return "Jendela login terblokir oleh browser. Izinkan popup atau coba lagi.";
         case "auth/popup-closed-by-user":
         case "auth/cancelled-popup-request":
           return "Proses login dibatalkan sebelum selesai.";
         case "auth/operation-not-allowed":
           return "Provider login ini belum diaktifkan di Firebase Console (Authentication → Sign-in method).";
         case "auth/unauthorized-domain":
-          return "Domain ini belum terdaftar di Authorized Domains Firebase Console.";
+          return `Domain "${window.location.hostname || "ini"}" belum terdaftar di Authorized Domains Firebase Console.`;
         default:
           return err?.message || "Autentikasi gagal. Coba beberapa saat lagi.";
       }
@@ -3516,14 +3520,16 @@
       resetButtonBusy();
       showLoginError(msg || `Gagal masuk dengan ${provider}.`);
     };
-    window.__onNativeAuthCancelled = () => {
+    window.__onNativeAuthCancelled = (provider) => {
       resetButtonBusy();
+      const label = provider === "apple" ? "Apple" : "Google";
+      showToast(`Login ${label} dibatalkan. Ketuk kembali untuk mencoba.`);
     };
     window.__onNativeSignOutComplete = () => {
       finalizeLogoutUI();
     };
 
-    // Handler Tombol Google (Asli via CredentialManager di Android / Firebase Popup di Web)
+    // Handler Tombol Google (Asli via CredentialManager/OAuth di Android / Firebase Popup+Redirect di Web)
     btnGoogle.addEventListener("click", async () => {
       const orig = btnGoogle.innerHTML;
       setButtonBusy(btnGoogle, orig);
@@ -3541,17 +3547,28 @@
         showLoginError("FIREBASE_CONFIG belum terkonfigurasi dengan benar.");
         return;
       }
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: "select_account" });
       try {
-        const provider = new GoogleAuthProvider();
         const res = await signInWithPopup(firebaseAuth, provider);
         await completeAuthSuccess(res.user, "google");
       } catch (err) {
+        if (err?.code === "auth/popup-blocked" || err?.code === "auth/operation-not-supported-in-this-environment") {
+          try {
+            await signInWithRedirect(firebaseAuth, provider);
+            return;
+          } catch (redirErr) {
+            resetButtonBusy();
+            showLoginError(mapFirebaseAuthError(redirErr));
+            return;
+          }
+        }
         resetButtonBusy();
         showLoginError(mapFirebaseAuthError(err));
       }
     });
 
-    // Handler Tombol Apple (Asli via Chrome Custom Tabs OAuthProvider di Android / Firebase Popup di Web)
+    // Handler Tombol Apple (Asli via Chrome Custom Tabs OAuthProvider di Android / Firebase Popup+Redirect di Web)
     btnApple.addEventListener("click", async () => {
       const orig = btnApple.innerHTML;
       setButtonBusy(btnApple, orig);
@@ -3569,15 +3586,29 @@
         showLoginError("FIREBASE_CONFIG belum terkonfigurasi dengan benar.");
         return;
       }
+      const provider = new OAuthProvider("apple.com");
+      provider.addScope("email");
+      provider.addScope("name");
       try {
-        const provider = new OAuthProvider("apple.com");
-        provider.addScope("email");
-        provider.addScope("name");
         const res = await signInWithPopup(firebaseAuth, provider);
         await completeAuthSuccess(res.user, "apple");
       } catch (err) {
+        if (err?.code === "auth/popup-blocked" || err?.code === "auth/operation-not-supported-in-this-environment") {
+          try {
+            await signInWithRedirect(firebaseAuth, provider);
+            return;
+          } catch (redirErr) {
+            resetButtonBusy();
+            showLoginError(mapFirebaseAuthError(redirErr));
+            return;
+          }
+        }
         resetButtonBusy();
-        showLoginError(mapFirebaseAuthError(err));
+        if (err?.code === "auth/operation-not-allowed") {
+          showLoginError("Provider Apple belum diaktifkan di Firebase Console proyek ini (Authentication → Sign-in method → Apple dengan Services ID, Team ID, Key ID, & kunci .p8).");
+        } else {
+          showLoginError(mapFirebaseAuthError(err));
+        }
       }
     });
 
@@ -5316,6 +5347,18 @@
       }, 950);
 
       if (firebaseAuth) {
+        getRedirectResult(firebaseAuth)
+          .then((res) => {
+            if (res && res.user && !state.user) {
+              const pid = res.providerId || res.user.providerData?.[0]?.providerId || "google";
+              const pName = pid.includes("apple") ? "apple" : (pid.includes("google") ? "google" : "email");
+              completeAuthSuccess(res.user, pName);
+            }
+          })
+          .catch((err) => {
+            showLoginError(mapFirebaseAuthError(err));
+          });
+
         onAuthStateChanged(firebaseAuth, (fbUser) => {
           if (fbUser && !state.user) {
             const pid = fbUser.providerData?.[0]?.providerId || "email";

@@ -46,6 +46,10 @@ import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
+import androidx.credentials.exceptions.GetCredentialException
+import androidx.credentials.exceptions.GetCredentialProviderConfigurationException
+import androidx.credentials.exceptions.GetCredentialUnsupportedException
+import androidx.credentials.exceptions.NoCredentialException
 import androidx.lifecycle.lifecycleScope
 import com.example.ui.theme.MyApplicationTheme
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
@@ -54,6 +58,7 @@ import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential.Companion.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
 import com.google.firebase.Firebase
 import com.google.firebase.auth.FirebaseAuthException
+import com.google.firebase.auth.FirebaseAuthWebException
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.OAuthProvider
@@ -351,60 +356,99 @@ class MainActivity : ComponentActivity() {
         } catch (e: GetCredentialCancellationException) {
           Log.w(TAG, "Google Sign-In cancelled or dismissed: ${e.message}", e)
           dispatchNativeAuthCancelled("google")
+        } catch (e: NoCredentialException) {
+          Log.w(TAG, "No Google credential on device; falling back to OAuth browser flow", e)
+          launchOAuthProvider("google", "google.com", listOf("email", "profile"))
+        } catch (e: GetCredentialProviderConfigurationException) {
+          Log.w(TAG, "Credential provider unavailable; falling back to OAuth browser flow", e)
+          launchOAuthProvider("google", "google.com", listOf("email", "profile"))
+        } catch (e: GetCredentialUnsupportedException) {
+          Log.w(TAG, "Credential Manager unsupported; falling back to OAuth browser flow", e)
+          launchOAuthProvider("google", "google.com", listOf("email", "profile"))
+        } catch (e: GetCredentialException) {
+          Log.e(TAG, "Credential Manager error: ${e.type} - ${e.message}", e)
+          launchOAuthProvider("google", "google.com", listOf("email", "profile"))
         } catch (e: CancellationException) {
           throw e
         } catch (e: Exception) {
           Log.e(TAG, "Google Sign-In failed", e)
-          dispatchNativeAuthError(
-            "google",
-            e.localizedMessage ?: "Gagal masuk dengan akun Google. Pastikan akun Google tersedia di perangkat."
-          )
+          dispatchNativeAuthError("google", mapAuthError("google", e))
         }
       }
     }
 
     @JavascriptInterface
     fun signInWithApple() {
-      runOnUiThread {
-        val provider = OAuthProvider.newBuilder("apple.com")
-          .setScopes(listOf("email", "name"))
-          .build()
+      launchOAuthProvider("apple", "apple.com", listOf("email", "name"))
+    }
 
-        val pending = Firebase.auth.pendingAuthResult
-        if (pending != null) {
-          pending
-            .addOnSuccessListener { result ->
-              val user = result.user
-              if (user != null) {
-                dispatchNativeAuthSuccess(user, "apple")
-              } else {
-                dispatchNativeAuthError("apple", "Gagal memuat profil Apple ID.")
-              }
-            }
-            .addOnFailureListener { e ->
-              dispatchNativeAuthError("apple", mapAppleError(e))
-            }
+    private fun launchOAuthProvider(providerKey: String, providerId: String, scopes: List<String>) {
+      runOnUiThread {
+        if (activity.isFinishing || activity.isDestroyed) {
+          dispatchNativeAuthError(providerKey, "Aktivitas aplikasi sedang ditutup. Silakan coba lagi.")
           return@runOnUiThread
         }
+        try {
+          val provider = OAuthProvider.newBuilder(providerId)
+            .setScopes(scopes)
+            .build()
 
+          val pending = Firebase.auth.pendingAuthResult
+          if (pending != null) {
+            pending
+              .addOnSuccessListener { result ->
+                val user = result.user
+                if (user != null) {
+                  val actualProvider = if (result.additionalUserInfo?.providerId?.contains("apple") == true) "apple" else providerKey
+                  dispatchNativeAuthSuccess(user, actualProvider)
+                } else {
+                  dispatchNativeAuthError(providerKey, "Gagal memuat profil akun.")
+                }
+              }
+              .addOnFailureListener { e ->
+                Log.w(TAG, "Pending OAuth result failed for $providerId: ${e.message}", e)
+                val code = (e as? FirebaseAuthException)?.errorCode
+                if (code == "ERROR_WEB_CONTEXT_CANCELED" || code == "ERROR_WEB_CONTEXT_ALREADY_PRESENTED") {
+                  startFreshOAuth(providerKey, provider)
+                } else {
+                  dispatchNativeAuthError(providerKey, mapAuthError(providerKey, e))
+                }
+              }
+            return@runOnUiThread
+          }
+
+          startFreshOAuth(providerKey, provider)
+        } catch (e: Exception) {
+          Log.e(TAG, "Failed to start OAuth flow for $providerId", e)
+          dispatchNativeAuthError(providerKey, mapAuthError(providerKey, e))
+        }
+      }
+    }
+
+    private fun startFreshOAuth(providerKey: String, provider: OAuthProvider) {
+      try {
         Firebase.auth
           .startActivityForSignInWithProvider(activity, provider)
           .addOnSuccessListener { result ->
             val user = result.user
             if (user != null) {
-              dispatchNativeAuthSuccess(user, "apple")
+              dispatchNativeAuthSuccess(user, providerKey)
             } else {
-              dispatchNativeAuthError("apple", "Gagal memuat profil Apple ID.")
+              dispatchNativeAuthError(providerKey, "Gagal memuat profil akun.")
             }
           }
           .addOnFailureListener { e ->
+            Log.e(TAG, "OAuth sign-in failed for $providerKey", e)
             val code = (e as? FirebaseAuthException)?.errorCode
             if (code == "ERROR_WEB_CONTEXT_CANCELED") {
-              dispatchNativeAuthCancelled("apple")
+              dispatchNativeAuthCancelled(providerKey)
             } else {
-              dispatchNativeAuthError("apple", mapAppleError(e))
+              dispatchNativeAuthError(providerKey, mapAuthError(providerKey, e))
             }
           }
+      } catch (e: Exception) {
+        Log.e(TAG, "Cannot open browser/Custom Tab for OAuth $providerKey", e)
+        dispatchNativeAuthError(providerKey, mapAuthError(providerKey, e))
       }
     }
 
@@ -586,15 +630,31 @@ class MainActivity : ComponentActivity() {
     prefs.edit().putStringSet("scheduled_codes", newCodes).apply()
   }
 
-  private fun mapAppleError(e: Exception): String {
+  private fun mapAuthError(providerKey: String, e: Exception): String {
     val authErr = e as? FirebaseAuthException
-    return when (authErr?.errorCode) {
-      "ERROR_OPERATION_NOT_ALLOWED" ->
-        "Provider Apple belum diaktifkan di Firebase Console (Authentication → Sign-in method → Apple)."
-      "ERROR_NETWORK_REQUEST_FAILED" ->
-        "Jaringan bermasalah. Periksa koneksi internet Anda lalu coba lagi."
-      else ->
-        e.localizedMessage ?: "Login Apple gagal. Pastikan provider Apple & Services ID sudah aktif di Firebase Console."
+    val webErr = e as? FirebaseAuthWebException
+    val code = authErr?.errorCode ?: webErr?.errorCode ?: ""
+    val rawMsg = (e.message ?: e.localizedMessage ?: "").lowercase()
+
+    if (code == "ERROR_OPERATION_NOT_ALLOWED" || rawMsg.contains("operation is not allowed") || rawMsg.contains("disabled for this firebase project")) {
+      return if (providerKey == "apple") {
+        "Provider Apple belum diaktifkan di Firebase Console proyek ini (Authentication → Sign-in method → Apple dengan Services ID, Team ID, Key ID, & kunci .p8)."
+      } else {
+        "Provider Google belum diaktifkan di Firebase Console proyek ini (Authentication → Sign-in method → Google)."
+      }
     }
+    if (code == "ERROR_NETWORK_REQUEST_FAILED" || rawMsg.contains("network")) {
+      return "Koneksi internet bermasalah. Periksa jaringan Anda lalu coba lagi."
+    }
+    if (code == "ERROR_INVALID_CREDENTIAL" || rawMsg.contains("invalid_credential") || rawMsg.contains("bad token")) {
+      return "Token login tidak valid atau kadaluarsa. Pastikan SHA-1 APK & Web Client ID sesuai di Firebase Console."
+    }
+    if (rawMsg.contains("no browser") || rawMsg.contains("activitynotfound")) {
+      return "Browser / Chrome Custom Tabs tidak ditemukan di perangkat untuk membuka halaman login."
+    }
+    if (providerKey == "apple") {
+      return e.localizedMessage ?: "Login Apple gagal. Pastikan provider Apple sudah diaktifkan di Firebase Console."
+    }
+    return e.localizedMessage ?: "Login Google gagal. Pastikan akun Google & koneksi internet tersedia."
   }
 }
