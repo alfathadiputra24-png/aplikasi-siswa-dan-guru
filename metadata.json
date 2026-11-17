@@ -1,0 +1,6 @@
+{
+  "name": "KelasKu",
+  "description": "Aplikasi manajemen kelas glassmorphism berbahasa Indonesia untuk pelajar dan pengajar.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
